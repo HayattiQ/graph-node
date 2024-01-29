@@ -20,6 +20,7 @@ services:
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
       ethereum: 'astar-zkevm-sepolia:http://106.179.25.54:1520/'
+      GRAPH_ALLOW_NON_DETERMINISTIC_IPFS: 1
       GRAPH_LOG: info
   ipfs:
     image: ipfs/kubo:v0.14.0
