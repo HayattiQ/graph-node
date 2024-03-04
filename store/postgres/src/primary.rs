@@ -629,7 +629,7 @@ mod queries {
             .into_iter()
             .map(|(subgraph, node, paused)| (subgraph, (node, paused)))
             .collect();
-        for mut info in infos {
+        for info in infos {
             info.node = nodes.get(&info.subgraph).map(|(node, _)| node.clone());
             info.paused = nodes.get(&info.subgraph).map(|(_, paused)| *paused);
         }
@@ -1680,6 +1680,22 @@ impl<'a> Connection<'a> {
                     .order_by(u::entity_count)
                     .load(self.conn.as_ref())?)
             }
+
+            Name(name) => Ok(u::table
+                .filter(u::subgraphs.is_not_null())
+                .filter(sql("ARRAY[").bind::<Text, _>(name).sql("] <@ subgraphs"))
+                .order_by(u::entity_count)
+                .load(self.conn.as_ref())?),
+
+            Hash(hash) => Ok(u::table
+                .filter(u::deployment.eq(hash))
+                .order_by(u::entity_count)
+                .load(self.conn.as_ref())?),
+
+            Deployment(id) => Ok(u::table
+                .filter(u::namespace.eq(id))
+                .order_by(u::entity_count)
+                .load(self.conn.as_ref())?),
         }
     }
 

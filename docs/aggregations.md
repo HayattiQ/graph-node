@@ -33,9 +33,11 @@ populate the `Stats` aggregations whenever a given hour or day ends.
 
 The type for the raw data points is defined with an `@entity(timeseries:
 true)` annotation. Timeseries types are immutable, and must have an `id`
-field and a `timestamp` field. The `timestamp` is set automatically by
-`graph-node` to the timestamp of the current block; if mappings set this
-field, it is silently overridden when the entity is saved.
+field and a `timestamp` field. The `id` must be of type `Int8` and is set
+automatically so that ids are increasing in insertion order. The `timestamp`
+is set automatically by `graph-node` to the timestamp of the current block;
+if mappings set this field, it is silently overridden when the entity is
+saved.
 
 Aggregations are declared with an `@aggregation` annotation instead of an
 `@entity` annotation. They must have an `id` field and a `timestamp` field.
@@ -76,7 +78,7 @@ type TokenStats @aggregation(intervals: ["hour", "day"], source: "TokenData") {
   token: Token!
   totalVolume: BigDecimal! @aggregate(fn: "sum", arg: "amount")
   priceUSD: BigDecimal! @aggregate(fn: "last", arg: "priceUSD")
-  count: Int8! @aggregate(fn: "count")
+  count: Int8! @aggregate(fn: "count", cumulative: true)
 }
 ```
 
@@ -85,18 +87,20 @@ _dimensions_, and fields with the `@aggregate` directive are called
 _aggregates_. A timeseries type really represents many timeseries, one for
 each combination of values for the dimensions.
 
-**TODO** As written, this supports buckets that start at zero with every new
-hour/day. We also want to support cumulative statistics, i.e., snapshotting
-of time series where a new bucket starts with the values of the previous
-bucket.
+The same timeseries can be used for multiple aggregations. For example, the
+`Stats` aggregation could also be formed by aggregating over the `TokenData`
+timeseries. Since `Stats` doesn't have a `token` dimension, all aggregates
+will be formed across all tokens.
+
+Each `@aggregate` by default starts at 0 for each new bucket and therefore
+just aggregates over the time interval for the bucket. The `@aggregate`
+directive also accepts a boolean flag `cumulative` that indicates whether
+the aggregation should be cumulative. Cumulative aggregations aggregate over
+the entire timeseries up to the end of the time interval for the bucket.
 
 **TODO** Since average is a little more complicated to handle for cumulative
 aggregations, and it doesn't seem like it used in practice, we won't
 initially support it. (same for variance, stddev etc.)
-
-**TODO** The timeseries type can be simplified for some situations if
-aggregations can be done over expressions, for example over `priceUSD *
-amount` to track `totalVolumeUSD`
 
 **TODO** It might be necessary to allow `@aggregate` fields that are only
 used for some intervals. We could allow that with syntax like
@@ -129,7 +133,10 @@ annotation. These attributes must be of a numeric type (`Int`, `Int8`,
 `BigInt`, or `BigDecimal`) The annotation must have two arguments:
 
 - `fn`: the name of an aggregation function
-- `arg`: the name of an attribute in the timeseries type
+- `arg`: the name of an attribute in the timeseries type, or an expression
+  using only constants and attributes of the timeseries type
+
+#### Aggregation functions
 
 The following aggregation functions are currently supported:
 
@@ -142,15 +149,45 @@ The following aggregation functions are currently supported:
 | `first` | First value       |
 | `last`  | Last value        |
 
+The `first` and `last` aggregation function calculate the first and last
+value in an interval by sorting the data by `id`; `graph-node` enforces
+correctness here by automatically setting the `id` for timeseries entities.
+
+#### Aggregation expressions
+
+The `arg` can be the name of any attribute in the timeseries type, or an
+expression using only constants and attributes of the timeseries type such
+as `price * amount` or `greatest(amount0, amount1)`. Expressions use SQL
+syntax and support a subset of builtin SQL functions, operators, and other
+constructs.
+
+Supported operators are `+`, `-`, `*`, `/`, `%`, `^`, `=`, `!=`, `<`, `<=`,
+`>`, `>=`, `<->`, `and`, `or`, and `not`. In addition the operators `is
+[not] {null|true|false}`, and `is [not] distinct from` are supported.
+
+The supported SQL functions are the [math
+functions](https://www.postgresql.org/docs/current/functions-math.html)
+`abs`, `ceil`, `ceiling`, `div`, `floor`, `gcd`, `lcm`, `mod`, `power`,
+`sign`, and the [conditional
+functions](https://www.postgresql.org/docs/current/functions-conditional.html)
+`coalesce`, `nullif`, `greatest`, and `least`.
+
+The
+[statement](https://www.postgresql.org/docs/current/functions-conditional.html#FUNCTIONS-CASE)
+`case when .. else .. end` is also supported.
+
+Some examples of valid expressions, assuming the underlying timeseries
+contains the mentioned fields:
+
+- Aggregate the value of a token: `@aggregate(fn: "sum", arg: "priceUSD * amount")`
+- Aggregate the maximum positive amount of two different amounts:
+  `@aggregate(fn: "max", arg: "greatest(amount0, amount1, 0)")`
+- Conditionally sum an amount: `@aggregate(fn: "sum", arg: "case when amount0 > amount1 then amount0 else 0 end")`
+
 ## Querying
 
 _This section is not implemented yet, and will require a bit more thought
 about details_
-
-**TODO** As written, timeseries points like `TokenData` can be queried like
-any other entity. It would be nice to restrict how these data points can be
-queried, maybe even forbid it, as that would give us more latitude in how we
-store that data.
 
 We create a toplevel query field for each aggregation. That query field
 accepts the following arguments:
@@ -160,11 +197,13 @@ accepts the following arguments:
 - A mandatory `interval`
 - An optional `current` to indicate whether to include the current,
   partially filled bucket in the response. Can be either `ignore` (the
-  default) or `include`
-- Optional `timestamp_{gte|gt|lt|lte|eq}` filters to restrict the range of
-  timestamps to return
-- Timeseries are always sorted by the dimensions in the order in which they
-  are declared in the schema and the `timestamp` in descending order
+  default) or `include` (still **TODO** and not implemented)
+- Optional `timestamp_{gte|gt|lt|lte|eq|in}` filters to restrict the range
+  of timestamps to return
+- Timeseries are always sorted by `timestamp` and `id` in descending order
+
+**TODO** It would be nicer to sort by the dimensions and `timestamp`, but we
+don't have the internal plumbing for multi-column sort in place.
 
 ```graphql
 token_stats(interval: "hour",

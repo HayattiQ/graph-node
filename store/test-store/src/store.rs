@@ -226,7 +226,7 @@ pub async fn create_test_subgraph_with_features(
     let manifest = SubgraphManifest::<graph::blockchain::mock::MockBlockchain> {
         id: subgraph_id.clone(),
         spec_version: Version::new(1, 0, 0),
-        features: features,
+        features,
         description: Some(format!("manifest for {}", subgraph_id)),
         repository: Some(format!("repo for {}", subgraph_id)),
         schema: schema.clone(),
@@ -299,6 +299,7 @@ pub async fn transact_errors(
             errs,
             Vec::new(),
             is_non_fatal_errors_active,
+            false,
         )
         .await?;
     flush(deployment).await
@@ -380,6 +381,7 @@ pub async fn transact_entities_and_dynamic_data_sources(
             data_sources,
             Vec::new(),
             Vec::new(),
+            false,
             false,
         )
         .await

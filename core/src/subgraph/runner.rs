@@ -4,9 +4,12 @@ use crate::subgraph::inputs::IndexingInputs;
 use crate::subgraph::state::IndexingState;
 use crate::subgraph::stream::new_block_stream;
 use atomic_refcell::AtomicRefCell;
-use graph::blockchain::block_stream::{BlockStreamEvent, BlockWithTriggers, FirehoseCursor};
+use graph::blockchain::block_stream::{
+    BlockStreamError, BlockStreamEvent, BlockWithTriggers, FirehoseCursor,
+};
 use graph::blockchain::{Block, BlockTime, Blockchain, DataSource as _, TriggerFilter as _};
 use graph::components::store::{EmptyStore, GetScope, ReadStore, StoredDynamicDataSource};
+use graph::components::subgraph::InstanceDSTemplate;
 use graph::components::{
     store::ModificationsAndCache,
     subgraph::{MappingError, PoICausalityRegion, ProofOfIndexing, SharedProofOfIndexing},
@@ -17,7 +20,7 @@ use graph::data::subgraph::{
     SubgraphFeature,
 };
 use graph::data_source::{
-    offchain, CausalityRegion, DataSource, DataSourceCreationError, DataSourceTemplate, TriggerData,
+    offchain, CausalityRegion, DataSource, DataSourceCreationError, TriggerData,
 };
 use graph::env::EnvVars;
 use graph::prelude::*;
@@ -64,7 +67,6 @@ where
             ctx,
             state: IndexingState {
                 should_try_unfail_non_deterministic: true,
-                synced: false,
                 skip_ptr_updates_timer: Instant::now(),
                 backoff: ExponentialBackoff::with_jitter(
                     (MINUTE * 2).min(env_vars.subgraph_error_retry_ceil),
@@ -206,7 +208,7 @@ where
                 &self.metrics.subgraph,
             )
             .await?
-            .map_err(CancelableError::Error)
+            .map_err(CancelableError::from)
             .cancelable(&block_stream_canceler, || Err(CancelableError::Cancel));
 
             // Keep the stream's cancel guard around to be able to shut it down when the subgraph
@@ -257,7 +259,6 @@ where
                                 store.block_ptr().map(|ptr| ptr.number).unwrap_or(0);
                             self.revert_state_to(last_good_block)?;
                             self.inputs = Arc::new(self.inputs.with_store(store));
-                            self.state.synced = self.inputs.store.is_deployment_synced().await?;
                         }
                         break;
                     }
@@ -497,7 +498,7 @@ where
             .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
         section.end();
 
-        debug!(self.logger, "Entity cache statistics";
+        trace!(self.logger, "Entity cache statistics";
             "weight" => evict_stats.new_weight,
             "evicted_weight" => evict_stats.evicted_weight,
             "count" => evict_stats.new_count,
@@ -537,8 +538,6 @@ where
         let _section = self.metrics.host.stopwatch.start_section("transact_block");
         let start = Instant::now();
 
-        let store = &self.inputs.store;
-
         // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
         if has_errors && !is_non_fatal_errors_active {
             let is_poi_entity =
@@ -559,8 +558,11 @@ where
 
         let first_error = deterministic_errors.first().cloned();
 
+        let is_caught_up = self.is_caught_up(&block_ptr).await?;
+
         persisted_data_sources.extend(persisted_off_chain_data_sources);
-        store
+        self.inputs
+            .store
             .transact_block_operations(
                 block_ptr,
                 block.timestamp(),
@@ -571,6 +573,7 @@ where
                 deterministic_errors,
                 processed_offchain_data_sources,
                 is_non_fatal_errors_active,
+                is_caught_up,
             )
             .await
             .context("Failed to transact block operations")?;
@@ -595,7 +598,8 @@ where
 
         // To prevent a buggy pending version from replacing a current version, if errors are
         // present the subgraph will be unassigned.
-        if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced().await? {
+        let store = &self.inputs.store;
+        if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced() {
             store
                 .unassign_subgraph()
                 .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
@@ -617,7 +621,7 @@ where
         block: &Arc<C::Block>,
         triggers: impl Iterator<Item = TriggerData<C>>,
         causality_region: &str,
-    ) -> Result<BlockState<C>, MappingError> {
+    ) -> Result<BlockState, MappingError> {
         let mut block_state = BlockState::new(
             self.inputs.store.clone(),
             std::mem::take(&mut self.state.entity_lfu_cache),
@@ -656,7 +660,7 @@ where
         block_data: Box<[u8]>,
         handler: String,
         causality_region: &str,
-    ) -> Result<BlockState<C>, MappingError> {
+    ) -> Result<BlockState, MappingError> {
         let block_state = BlockState::new(
             self.inputs.store.clone(),
             std::mem::take(&mut self.state.entity_lfu_cache),
@@ -681,20 +685,34 @@ where
 
     fn create_dynamic_data_sources(
         &mut self,
-        created_data_sources: Vec<DataSourceTemplateInfo<C>>,
+        created_data_sources: Vec<InstanceDSTemplateInfo>,
     ) -> Result<(Vec<DataSource<C>>, Vec<Arc<T::Host>>), Error> {
         let mut data_sources = vec![];
         let mut runtime_hosts = vec![];
 
         for info in created_data_sources {
-            // Try to instantiate a data source from the template
+            let manifest_idx = info
+                .template
+                .manifest_idx()
+                .ok_or_else(|| anyhow!("Expected template to have an idx"))?;
+            let created_ds_template = self
+                .inputs
+                .templates
+                .iter()
+                .find(|t| t.manifest_idx() == manifest_idx)
+                .ok_or_else(|| {
+                    anyhow!("Expected to find a template for this dynamic data source")
+                })?;
 
+            // Try to instantiate a data source from the template
             let data_source = {
                 let res = match info.template {
-                    DataSourceTemplate::Onchain(_) => C::DataSource::from_template_info(info)
-                        .map(DataSource::Onchain)
-                        .map_err(DataSourceCreationError::from),
-                    DataSourceTemplate::Offchain(_) => offchain::DataSource::from_template_info(
+                    InstanceDSTemplate::Onchain(_) => {
+                        C::DataSource::from_template_info(info, created_ds_template)
+                            .map(DataSource::Onchain)
+                            .map_err(DataSourceCreationError::from)
+                    }
+                    InstanceDSTemplate::Offchain(_) => offchain::DataSource::from_template_info(
                         info,
                         self.ctx.causality_region_next_value(),
                     )
@@ -753,28 +771,6 @@ where
 
         match action {
             Ok(action) => {
-                // Once synced, no need to try to update the status again.
-                if !self.state.synced
-                    && close_to_chain_head(
-                        &block_ptr,
-                        self.inputs.chain.chain_store().chain_head_ptr().await?,
-                        // We consider a subgraph synced when it's at most 1 block behind the
-                        // chain head.
-                        1,
-                    )
-                {
-                    // Updating the sync status is an one way operation.
-                    // This state change exists: not synced -> synced
-                    // This state change does NOT: synced -> not synced
-                    self.inputs.store.deployment_synced()?;
-
-                    // Stop trying to update the sync status.
-                    self.state.synced = true;
-
-                    // Stop recording time-to-sync metrics.
-                    self.metrics.stream.stopwatch.disable();
-                }
-
                 // Keep trying to unfail subgraph for everytime it advances block(s) until it's
                 // health is not Failed anymore.
                 if self.state.should_try_unfail_non_deterministic {
@@ -810,6 +806,13 @@ where
             // Handle unexpected stream errors by marking the subgraph as failed.
             Err(e) => {
                 self.metrics.stream.deployment_failed.set(1.0);
+                let last_good_block = self
+                    .inputs
+                    .store
+                    .block_ptr()
+                    .map(|ptr| ptr.number)
+                    .unwrap_or(0);
+                self.revert_state_to(last_good_block)?;
 
                 let message = format!("{:#}", e).replace('\n', "\t");
                 let err = anyhow!("{}, code: {}", message, LogCode::SubgraphSyncingFailure);
@@ -878,7 +881,7 @@ where
 
     fn persist_dynamic_data_sources(
         &mut self,
-        block_state: &mut BlockState<C>,
+        block_state: &mut BlockState,
         data_sources: Vec<DataSource<C>>,
     ) {
         if !data_sources.is_empty() {
@@ -901,6 +904,28 @@ where
             block_state.persist_data_source(data_source.as_stored_dynamic_data_source());
         }
     }
+
+    /// We consider a subgraph caught up when it's at most 10 blocks behind the chain head.
+    async fn is_caught_up(&mut self, block_ptr: &BlockPtr) -> Result<bool, Error> {
+        const CAUGHT_UP_DISTANCE: BlockNumber = 10;
+
+        // Ensure that `state.cached_head_ptr` has a value since it could be `None` on the first
+        // iteration of loop. If the deployment head has caught up to the `cached_head_ptr`, update
+        // it so that we are up to date when checking if synced.
+        let cached_head_ptr = self.state.cached_head_ptr.cheap_clone();
+        if cached_head_ptr.is_none()
+            || close_to_chain_head(&block_ptr, &cached_head_ptr, CAUGHT_UP_DISTANCE)
+        {
+            self.state.cached_head_ptr = self.inputs.chain.chain_store().chain_head_ptr().await?;
+        }
+        let is_caught_up =
+            close_to_chain_head(&block_ptr, &self.state.cached_head_ptr, CAUGHT_UP_DISTANCE);
+        if is_caught_up {
+            // Stop recording time-to-sync metrics.
+            self.metrics.stream.stopwatch.disable();
+        }
+        Ok(is_caught_up)
+    }
 }
 
 impl<C, T> SubgraphRunner<C, T>
@@ -910,7 +935,7 @@ where
 {
     async fn handle_stream_event(
         &mut self,
-        event: Option<Result<BlockStreamEvent<C>, CancelableError<Error>>>,
+        event: Option<Result<BlockStreamEvent<C>, CancelableError<BlockStreamError>>>,
         cancel_handle: &CancelHandle,
     ) -> Result<Action, Error> {
         let action = match event {
@@ -984,7 +1009,7 @@ where
             // Using an `EmptyStore` and clearing the cache for each trigger is a makeshift way to
             // get causality region isolation.
             let schema = ReadStore::input_schema(&self.inputs.store);
-            let mut block_state = BlockState::<C>::new(EmptyStore::new(schema), LfuCache::new());
+            let mut block_state = BlockState::new(EmptyStore::new(schema), LfuCache::new());
 
             // PoI ignores offchain events.
             // See also: poi-ignores-offchain
@@ -1057,8 +1082,8 @@ impl Action {
     /// Return `true` if the action indicates that we are done with a block
     fn block_finished(&self) -> bool {
         match self {
-            Action::Continue | Action::Restart => false,
-            Action::Stop => true,
+            Action::Restart => false,
+            Action::Continue | Action::Stop => true,
         }
     }
 }
@@ -1087,7 +1112,7 @@ trait StreamEventHandler<C: Blockchain> {
     ) -> Result<Action, Error>;
     async fn handle_err(
         &mut self,
-        err: CancelableError<Error>,
+        err: CancelableError<BlockStreamError>,
         cancel_handle: &CancelHandle,
     ) -> Result<Action, Error>;
     fn needs_restart(&self, revert_to_ptr: BlockPtr, subgraph_ptr: BlockPtr) -> bool;
@@ -1203,7 +1228,7 @@ where
             .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
         section.end();
 
-        debug!(self.logger, "Entity cache statistics";
+        trace!(self.logger, "Entity cache statistics";
             "weight" => evict_stats.new_weight,
             "evicted_weight" => evict_stats.evicted_weight,
             "count" => evict_stats.new_count,
@@ -1235,8 +1260,6 @@ where
         let _section = self.metrics.host.stopwatch.start_section("transact_block");
         let start = Instant::now();
 
-        let store = &self.inputs.store;
-
         // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
         if has_errors && !is_non_fatal_errors_active {
             let is_poi_entity =
@@ -1256,7 +1279,11 @@ where
 
         let first_error = deterministic_errors.first().cloned();
 
-        store
+        // We consider a subgraph caught up when it's at most 1 blocks behind the chain head.
+        let is_caught_up = self.is_caught_up(&block_ptr).await?;
+
+        self.inputs
+            .store
             .transact_block_operations(
                 block_ptr,
                 block_time,
@@ -1267,6 +1294,7 @@ where
                 deterministic_errors,
                 vec![],
                 is_non_fatal_errors_active,
+                is_caught_up,
             )
             .await
             .context("Failed to transact block operations")?;
@@ -1291,7 +1319,8 @@ where
 
         // To prevent a buggy pending version from replacing a current version, if errors are
         // present the subgraph will be unassigned.
-        if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced().await? {
+        let store = &self.inputs.store;
+        if has_errors && !ENV_VARS.disable_fail_fast && !store.is_deployment_synced() {
             store
                 .unassign_subgraph()
                 .map_err(|e| BlockProcessingError::Unknown(e.into()))?;
@@ -1325,10 +1354,10 @@ where
 
         if block.trigger_count() == 0
             && self.state.skip_ptr_updates_timer.elapsed() <= SKIP_PTR_UPDATES_THRESHOLD
-            && !self.state.synced
+            && !self.inputs.store.is_deployment_synced()
             && !close_to_chain_head(
                 &block_ptr,
-                self.inputs.chain.chain_store().chain_head_ptr().await?,
+                &self.inputs.chain.chain_store().chain_head_ptr().await?,
                 // The "skip ptr updates timer" is ignored when a subgraph is at most 1000 blocks
                 // behind the chain head.
                 1000,
@@ -1399,13 +1428,40 @@ where
 
     async fn handle_err(
         &mut self,
-        err: CancelableError<Error>,
+        err: CancelableError<BlockStreamError>,
         cancel_handle: &CancelHandle,
     ) -> Result<Action, Error> {
         if cancel_handle.is_canceled() {
             debug!(&self.logger, "Subgraph block stream shut down cleanly");
             return Ok(Action::Stop);
         }
+
+        let err = match err {
+            CancelableError::Error(BlockStreamError::Fatal(msg)) => {
+                error!(
+                    &self.logger,
+                    "The block stream encountered a substreams fatal error and will not retry: {}",
+                    msg
+                );
+
+                // If substreams returns a deterministic error we may not necessarily have a specific block
+                // but we should not retry since it will keep failing.
+                self.inputs
+                    .store
+                    .fail_subgraph(SubgraphError {
+                        subgraph_id: self.inputs.deployment.hash.clone(),
+                        message: msg,
+                        block_ptr: None,
+                        handler: None,
+                        deterministic: true,
+                    })
+                    .await
+                    .context("Failed to set subgraph status to `failed`")?;
+
+                return Ok(Action::Stop);
+            }
+            e => e,
+        };
 
         debug!(
             &self.logger,
@@ -1502,10 +1558,10 @@ async fn update_proof_of_indexing(
     Ok(())
 }
 
-/// Checks if the Deployment BlockPtr is at least X blocks behind to the chain head.
+/// Checks if the Deployment BlockPtr is within N blocks of the chain head or ahead.
 fn close_to_chain_head(
     deployment_head_ptr: &BlockPtr,
-    chain_head_ptr: Option<BlockPtr>,
+    chain_head_ptr: &Option<BlockPtr>,
     n: BlockNumber,
 ) -> bool {
     matches!((deployment_head_ptr, &chain_head_ptr), (b1, Some(b2)) if b1.number >= (b2.number - n))
@@ -1531,15 +1587,23 @@ fn test_close_to_chain_head() {
     ))
     .unwrap();
 
-    assert!(!close_to_chain_head(&block_0, None, offset));
-    assert!(!close_to_chain_head(&block_2, None, offset));
+    assert!(!close_to_chain_head(&block_0, &None, offset));
+    assert!(!close_to_chain_head(&block_2, &None, offset));
 
     assert!(!close_to_chain_head(
         &block_0,
-        Some(block_2.clone()),
+        &Some(block_2.clone()),
         offset
     ));
 
-    assert!(close_to_chain_head(&block_1, Some(block_2.clone()), offset));
-    assert!(close_to_chain_head(&block_2, Some(block_2.clone()), offset));
+    assert!(close_to_chain_head(
+        &block_1,
+        &Some(block_2.clone()),
+        offset
+    ));
+    assert!(close_to_chain_head(
+        &block_2,
+        &Some(block_2.clone()),
+        offset
+    ));
 }

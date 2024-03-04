@@ -326,7 +326,7 @@ impl fmt::Display for ChainIdentifier {
 
 /// The timestamp associated with a block. This is used whenever a time
 /// needs to be connected to data within the block
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BlockTime(DateTime<Utc>);
 
 impl BlockTime {
@@ -341,13 +341,19 @@ impl BlockTime {
     /// Construct a block time that is the given number of seconds and
     /// nanoseconds after the Unix epoch
     pub fn since_epoch(secs: i64, nanos: u32) -> Self {
-        Self(DateTime::from_timestamp(secs, nanos).unwrap())
+        Self(
+            DateTime::from_timestamp(secs, nanos)
+                .ok_or_else(|| anyhow!("invalid block time: {}s {}ns", secs, nanos))
+                .unwrap(),
+        )
     }
 
-    /// Construct a block time for tests where blocks are exactly 10s apart
+    /// Construct a block time for tests where blocks are exactly 45 minutes
+    /// apart. We use that big a timespan to make it easier to trigger
+    /// hourly rollups in tests
     #[cfg(debug_assertions)]
     pub fn for_test(ptr: &BlockPtr) -> Self {
-        Self::since_epoch(ptr.number as i64 * 10, 0)
+        Self::since_epoch(ptr.number as i64 * 45 * 60, 0)
     }
 
     pub fn as_secs_since_epoch(&self) -> i64 {

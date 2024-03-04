@@ -107,6 +107,10 @@ pub trait SubgraphStore: Send + Sync + 'static {
         node_id: &NodeId,
     ) -> Result<(), StoreError>;
 
+    fn pause_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
+
+    fn resume_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
+
     fn assigned_node(&self, deployment: &DeploymentLocator) -> Result<Option<NodeId>, StoreError>;
 
     /// Returns Option<(node_id,is_paused)> where `node_id` is the node that
@@ -323,6 +327,11 @@ pub trait WritableStore: ReadStore + DeploymentCursorTracker {
     /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
     /// `block_ptr_to` must point to a child block of the current subgraph block pointer.
+    ///
+    /// `is_caught_up_with_chain_head` indicates if `block_ptr_to` is close enough to the chain head
+    /// to be considered 'caught up', for purposes such as setting the synced flag or turning off
+    /// write batching. This is as vague as it sounds, it is not deterministic and should be treated
+    /// as a hint only.
     async fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
@@ -334,16 +343,15 @@ pub trait WritableStore: ReadStore + DeploymentCursorTracker {
         deterministic_errors: Vec<SubgraphError>,
         offchain_to_remove: Vec<StoredDynamicDataSource>,
         is_non_fatal_errors_active: bool,
+        is_caught_up_with_chain_head: bool,
     ) -> Result<(), StoreError>;
 
-    /// The deployment `id` finished syncing, mark it as synced in the database
-    /// and promote it to the current version in the subgraphs where it was the
-    /// pending version so far
+    /// Force synced status, used for testing.
     fn deployment_synced(&self) -> Result<(), StoreError>;
 
-    /// Return true if the deployment with the given id is fully synced,
-    /// and return false otherwise. Errors from the store are passed back up
-    async fn is_deployment_synced(&self) -> Result<bool, StoreError>;
+    /// Return true if the deployment with the given id is fully synced, and return false otherwise.
+    /// Cheap, cached operation.
+    fn is_deployment_synced(&self) -> bool;
 
     fn unassign_subgraph(&self) -> Result<(), StoreError>;
 
@@ -490,14 +498,14 @@ pub trait ChainStore: Send + Sync + 'static {
     /// may purge any other blocks with that number
     fn confirm_block_hash(&self, number: BlockNumber, hash: &BlockHash) -> Result<usize, Error>;
 
-    /// Find the block with `block_hash` and return the network name, number and timestamp if present.
+    /// Find the block with `block_hash` and return the network name, number, timestamp and parentHash if present.
     /// Currently, the timestamp is only returned if it's present in the top level block. This format is
     /// depends on the chain and the implementation of Blockchain::Block for the specific chain.
     /// eg: {"block": { "timestamp": 123123123 } }
     async fn block_number(
         &self,
         hash: &BlockHash,
-    ) -> Result<Option<(String, BlockNumber, Option<u64>)>, StoreError>;
+    ) -> Result<Option<(String, BlockNumber, Option<u64>, Option<BlockHash>)>, StoreError>;
 
     /// Tries to retrieve all transactions receipts for a given block.
     async fn transaction_receipts_in_block(
@@ -553,13 +561,13 @@ pub trait QueryStore: Send + Sync {
     async fn block_number(&self, block_hash: &BlockHash)
         -> Result<Option<BlockNumber>, StoreError>;
 
-    /// Returns the blocknumber as well as the timestamp. Timestamp depends on the chain block type
+    /// Returns the blocknumber, timestamp and the parentHash. Timestamp depends on the chain block type
     /// and can have multiple formats, it can also not be prevent. For now this is only available
     /// for EVM chains both firehose and rpc.
-    async fn block_number_with_timestamp(
+    async fn block_number_with_timestamp_and_parent_hash(
         &self,
         block_hash: &BlockHash,
-    ) -> Result<Option<(BlockNumber, Option<u64>)>, StoreError>;
+    ) -> Result<Option<(BlockNumber, Option<u64>, Option<BlockHash>)>, StoreError>;
 
     fn wait_stats(&self) -> Result<PoolWaitStats, StoreError>;
 
