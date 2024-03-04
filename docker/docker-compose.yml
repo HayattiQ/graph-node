@@ -19,7 +19,7 @@ services:
       postgres_pass: let-me-in
       postgres_db: graph-node
       ipfs: 'ipfs:5001'
-      ethereum: 'astar-zkevm-sepolia:http://106.179.25.54:1520/'
+      ethereum: 'astar-zkevm-mainnet:https://rpc.startale.com/astar-zkevm?apikey=8P913y62tWiJlrBStnk81hDhjqSfzcoj'
       GRAPH_ALLOW_NON_DETERMINISTIC_IPFS: 1
       GRAPH_LOG: info
   ipfs:
