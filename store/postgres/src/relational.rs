@@ -362,9 +362,9 @@ impl Layout {
             qualified_name: SqlName::qualified_name(&catalog.site.namespace, &table_name),
             name: table_name,
             columns,
-            /// The position of this table in all the tables for this layout; this
-            /// is really only needed for the tests to make the names of indexes
-            /// predictable
+            // The position of this table in all the tables for this layout; this
+            // is really only needed for the tests to make the names of indexes
+            // predictable
             position: position as u32,
             is_account_like: false,
             immutable: false,
@@ -753,7 +753,7 @@ impl Layout {
             let entity_keys: Vec<_> = rows.iter().map(|row| row.id()).collect();
             // FIXME: we clone all the ids here
             let entity_keys = IdList::try_from_iter(
-                &group.entity_type,
+                group.entity_type.id_type()?,
                 entity_keys.into_iter().map(|id| id.to_owned()),
             )?;
             ClampRangeQuery::new(table, &entity_keys, block)?.execute(conn)?;
@@ -799,7 +799,7 @@ impl Layout {
             for chunk in ids.chunks(DELETE_OPERATION_CHUNK_SIZE) {
                 // FIXME: we clone all the ids here
                 let chunk = IdList::try_from_iter(
-                    &group.entity_type,
+                    group.entity_type.id_type()?,
                     chunk.into_iter().map(|id| (*id).to_owned()),
                 )?;
                 count += ClampRangeQuery::new(table, &chunk, block)?.execute(conn)?
@@ -1020,22 +1020,54 @@ impl Layout {
         last_rollup: Option<BlockTime>,
         block_times: &[(BlockNumber, BlockTime)],
     ) -> Result<(), StoreError> {
+        if block_times.is_empty() {
+            return Ok(());
+        }
+
+        // If we have never done a rollup, we can just use the smallest
+        // block time we are getting as the time for the last rollup
+        let mut last_rollup = last_rollup.unwrap_or_else(|| {
+            block_times
+                .iter()
+                .map(|(_, block_time)| *block_time)
+                .min()
+                .unwrap()
+        });
         // The for loop could be eliminated if the rollup queries could deal
         // with the full `block_times` vector, but the SQL for that will be
         // very complicated and is left for a future improvement.
-        let mut last_rollup = last_rollup.unwrap_or(BlockTime::NONE);
         for (block, block_time) in block_times {
             for rollup in &self.rollups {
                 let buckets = rollup.interval.buckets(last_rollup, *block_time);
-                if buckets.is_empty() {
-                    // The rollups are in increasing order of interval size, so
-                    // if a smaller interval doesn't have a bucket between
-                    // last_rollup and block_time, a larger one can't either and
-                    // we are done with this rollup.
-                    break;
-                }
-                for bucket in buckets {
-                    rollup.insert(conn, &bucket, *block)?;
+                // We only need to pay attention to the first bucket; if
+                // there are more buckets, there's nothing to rollup for
+                // them as the next changes we wrote are for `block_time`,
+                // and we'll catch that on the next iteration of the loop.
+                //
+                // Assume we are passed `block_times = [b1, b2, b3, .. ]`
+                // but b1 and b2 are far apart. We call
+                // `rollup.interval.buckets(b1, b2)` at some point in the
+                // iteration which produces timestamps `[t1, t2, ..]`. Since
+                // b1 and b2 are far apart, we have something like `t1 <= b1
+                // < t2 < t3 < t4 < t5 <= b2` but we know that there are no
+                // writes between `b1` and `b2` - if there were, we'd have
+                // some block time in `block_times` between `b1` and `b2`.
+                // So we only need to do a rollup for `t1 < b1 < t2`. After
+                // that, we set `last_rollup = b2` and repeat the loop for
+                // that, which will roll up the bucket `t5 <= b2 < t6`. So
+                // there's no need to worry about the buckets starting at
+                // `t2`, `t3`, and `t4`.
+                match buckets.first() {
+                    None => {
+                        // The rollups are in increasing order of interval size, so
+                        // if a smaller interval doesn't have a bucket between
+                        // last_rollup and block_time, a larger one can't either and
+                        // we are done with this rollup.
+                        break;
+                    }
+                    Some(bucket) => {
+                        rollup.insert(conn, &bucket, *block)?;
+                    }
                 }
             }
             last_rollup = *block_time;
@@ -1150,7 +1182,7 @@ impl ColumnType {
             ColumnType::BigDecimal => "numeric",
             ColumnType::BigInt => "numeric",
             ColumnType::Bytes => "bytea",
-            ColumnType::Int => "integer",
+            ColumnType::Int => "int4",
             ColumnType::Int8 => "int8",
             ColumnType::String => "text",
             ColumnType::TSVector(_) => "tsvector",
@@ -1330,7 +1362,9 @@ pub(crate) const VID_COLUMN: &str = "vid";
 
 #[derive(Debug, Clone)]
 pub struct Table {
-    /// The name of the GraphQL object type ('Thing')
+    /// The reference to the underlying type in the input schema. For
+    /// aggregations, this is the object type for a specific interval, like
+    /// `Stats_hour`, not the overall aggregation type `Stats`.
     pub object: EntityType,
     /// The name of the database table for this type ('thing'), snakecased
     /// version of `object`
@@ -1380,7 +1414,7 @@ impl Table {
         let columns = object_type
             .fields
             .into_iter()
-            .filter(|field| !field.is_derived)
+            .filter(|field| !field.is_derived())
             .map(|field| Column::new(schema, &table_name, field, catalog))
             .chain(fulltexts.iter().map(Column::new_fulltext))
             .collect::<Result<Vec<Column>, StoreError>>()?;
@@ -1438,7 +1472,7 @@ impl Table {
         self.columns
             .iter()
             .find(|column| column.field == field)
-            .ok_or_else(|| StoreError::UnknownField(field.to_string()))
+            .ok_or_else(|| StoreError::UnknownField(self.name.to_string(), field.to_string()))
     }
 
     fn can_copy_from(&self, source: &Self) -> Vec<String> {
@@ -1470,7 +1504,7 @@ impl Table {
 
     pub(crate) fn analyze(&self, conn: &PgConnection) -> Result<(), StoreError> {
         let table_name = &self.qualified_name;
-        let sql = format!("analyze {table_name}");
+        let sql = format!("analyze (skip_locked) {table_name}");
         conn.execute(&sql)?;
         Ok(())
     }

@@ -21,7 +21,7 @@ pub mod ast;
 mod entity_key;
 mod entity_type;
 mod fulltext;
-mod input_schema;
+mod input;
 
 pub use api::{is_introspection_field, APISchemaError, INTROSPECTION_QUERY_TYPE};
 
@@ -29,9 +29,11 @@ pub use api::{ApiSchema, ErrorPolicy};
 pub use entity_key::EntityKey;
 pub use entity_type::{AsEntityTypeName, EntityType};
 pub use fulltext::{FulltextAlgorithm, FulltextConfig, FulltextDefinition, FulltextLanguage};
-pub use input_schema::{
-    Aggregate, AggregateFn, Aggregation, AggregationInterval, AggregationMapping, Field,
-    InputSchema, InterfaceType, ObjectType, TypeKind,
+pub use input::sqlexpr::{ExprVisitor, VisitExpr};
+pub(crate) use input::POI_OBJECT;
+pub use input::{
+    kw, Aggregate, AggregateFn, Aggregation, AggregationInterval, AggregationMapping, Field,
+    InputSchema, InterfaceType, ObjectOrInterface, ObjectType, TypeKind,
 };
 
 pub const SCHEMA_TYPE_NAME: &str = "_Schema_";
@@ -173,10 +175,18 @@ pub enum SchemaValidationError {
     AggregationNonMatchingArg(String, String, String, String, String),
     #[error("Field {1} in aggregation {0} has arg `{3}` but that is not a numeric field in {2}")]
     AggregationNonNumericArg(String, String, String, String),
+    #[error("Field {1} in aggregation {0} has an invalid value for `cumulative`. It needs to be a boolean")]
+    AggregationInvalidCumulative(String, String),
     #[error("Aggregations are not supported with spec version {0}; please migrate the subgraph to the latest version")]
     AggregationsNotSupported(Version),
     #[error("Using Int8 as the type for the `id` field is not supported with spec version {0}; please migrate the subgraph to the latest version")]
     IdTypeInt8NotSupported(Version),
+    #[error("{0}")]
+    ExprNotSupported(String),
+    #[error("Expressions can't us the function {0}")]
+    ExprIllegalFunction(String),
+    #[error("Failed to parse expression: {0}")]
+    ExprParseError(String),
 }
 
 /// A validated and preprocessed GraphQL schema for a subgraph.

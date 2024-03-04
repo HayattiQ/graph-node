@@ -1328,14 +1328,14 @@ impl DeploymentStore {
     ) -> Result<StoreEvent, StoreError> {
         let conn = self.get_conn()?;
 
-        // Unwrap: If we are reverting then the block ptr is not `None`.
-        let block_ptr_from = Self::block_ptr_with_conn(&conn, site.cheap_clone())?.unwrap();
+        let block_ptr_from = Self::block_ptr_with_conn(&conn, site.cheap_clone())?;
 
         // Sanity check on block numbers
-        if block_ptr_from.number <= block_ptr_to.number {
+        let from_number = block_ptr_from.map(|ptr| ptr.number);
+        if from_number <= Some(block_ptr_to.number) {
             constraint_violation!(
                 "truncate must go backwards, but would go from block {} to block {}",
-                block_ptr_from.number,
+                from_number.unwrap_or(0),
                 block_ptr_to.number
             );
         }
@@ -1352,14 +1352,14 @@ impl DeploymentStore {
     ) -> Result<StoreEvent, StoreError> {
         let conn = self.get_conn()?;
 
-        // Unwrap: If we are reverting then the block ptr is not `None`.
-        let block_ptr_from = Self::block_ptr_with_conn(&conn, site.cheap_clone())?.unwrap();
+        let block_ptr_from = Self::block_ptr_with_conn(&conn, site.cheap_clone())?;
 
         // Sanity check on block numbers
-        if block_ptr_from.number <= block_ptr_to.number {
+        let from_number = block_ptr_from.map(|ptr| ptr.number);
+        if from_number <= Some(block_ptr_to.number) {
             constraint_violation!(
                 "rewind must go backwards, but would go from block {} to block {}",
-                block_ptr_from.number,
+                from_number.unwrap_or(0),
                 block_ptr_to.number
             );
         }
@@ -1903,7 +1903,7 @@ fn resolve_column<'a>(table: &'a Table, field: &str) -> Result<(&'a SqlName, Str
             let sql_name = SqlName::from(field);
             table
                 .column(&sql_name)
-                .ok_or_else(|| StoreError::UnknownField(field.to_string()))
+                .ok_or_else(|| StoreError::UnknownField(table.name.to_string(), field.to_string()))
         })
         .map(|column| {
             let index_expr =

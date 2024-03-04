@@ -127,6 +127,7 @@ pub trait DeploymentPlacer {
 pub mod unused {
     use graph::prelude::chrono::Duration;
 
+    #[derive(Debug)]
     pub enum Filter {
         /// List all unused deployments
         All,
@@ -135,6 +136,12 @@ pub mod unused {
         /// List only deployments that were recorded as unused at least this
         /// long ago but have not been removed at
         UnusedLongerThan(Duration),
+        /// Lists deployments with a specific name
+        Name(String),
+        /// Lists deployments with a specific hash
+        Hash(String),
+        /// Lists deployments with a specific deployment id
+        Deployment(String),
     }
 }
 
@@ -1310,6 +1317,24 @@ impl SubgraphStoreTrait for SubgraphStore {
         let pconn = self.primary_conn()?;
         pconn.transaction(|| -> Result<_, StoreError> {
             let changes = pconn.reassign_subgraph(site.as_ref(), node_id)?;
+            pconn.send_store_event(&self.sender, &StoreEvent::new(changes))
+        })
+    }
+
+    fn pause_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError> {
+        let site = self.find_site(deployment.id.into())?;
+        let pconn = self.primary_conn()?;
+        pconn.transaction(|| -> Result<_, StoreError> {
+            let changes = pconn.pause_subgraph(site.as_ref())?;
+            pconn.send_store_event(&self.sender, &StoreEvent::new(changes))
+        })
+    }
+
+    fn resume_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError> {
+        let site = self.find_site(deployment.id.into())?;
+        let pconn = self.primary_conn()?;
+        pconn.transaction(|| -> Result<_, StoreError> {
+            let changes = pconn.resume_subgraph(site.as_ref())?;
             pconn.send_store_event(&self.sender, &StoreEvent::new(changes))
         })
     }

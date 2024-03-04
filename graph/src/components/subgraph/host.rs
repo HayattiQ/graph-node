@@ -69,21 +69,21 @@ pub trait RuntimeHost<C: Blockchain>: Send + Sync + 'static {
         block_time: BlockTime,
         block_data: Box<[u8]>,
         handler: String,
-        state: BlockState<C>,
+        state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         instrument: bool,
-    ) -> Result<BlockState<C>, MappingError>;
+    ) -> Result<BlockState, MappingError>;
 
     async fn process_mapping_trigger(
         &self,
         logger: &Logger,
         trigger: TriggerWithHandler<MappingTrigger<C>>,
-        state: BlockState<C>,
+        state: BlockState,
         proof_of_indexing: SharedProofOfIndexing,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         instrument: bool,
-    ) -> Result<BlockState<C>, MappingError>;
+    ) -> Result<BlockState, MappingError>;
 
     /// Block number in which this host was created.
     /// Returns `None` for static data sources.
@@ -127,11 +127,7 @@ impl HostMetrics {
                 "deployment_eth_call_execution_time",
                 "Measures the execution time for eth_call",
                 subgraph,
-                vec![
-                    String::from("contract_name"),
-                    String::from("address"),
-                    String::from("method"),
-                ],
+                vec![String::from("contract_name"), String::from("method")],
                 vec![0.1, 0.5, 1.0, 10.0, 100.0],
             )
             .expect("failed to create `deployment_eth_call_execution_time` histogram");
@@ -170,11 +166,10 @@ impl HostMetrics {
         &self,
         duration: f64,
         contract_name: &str,
-        address: &str,
         method: &str,
     ) {
         self.eth_call_execution_time
-            .with_label_values(&[contract_name, address, method][..])
+            .with_label_values(&[contract_name, method][..])
             .observe(duration);
     }
 

@@ -23,8 +23,10 @@ use crate::prelude::{s, DeploymentHash};
 use crate::schema::api::api_schema;
 use crate::util::intern::{Atom, AtomPool};
 
-use super::fulltext::FulltextDefinition;
-use super::{ApiSchema, AsEntityTypeName, EntityType, Schema};
+use crate::schema::fulltext::FulltextDefinition;
+use crate::schema::{ApiSchema, AsEntityTypeName, EntityType, Schema};
+
+pub mod sqlexpr;
 
 /// The name of the PoI entity type
 pub(crate) const POI_OBJECT: &str = "Poi$";
@@ -33,7 +35,7 @@ const POI_DIGEST: &str = "digest";
 /// The name of the PoI attribute for storing the block time
 const POI_BLOCK_TIME: &str = "blockTime";
 
-mod kw {
+pub mod kw {
     pub const ENTITY: &str = "entity";
     pub const IMMUTABLE: &str = "immutable";
     pub const TIMESERIES: &str = "timeseries";
@@ -44,6 +46,8 @@ mod kw {
     pub const FUNC: &str = "fn";
     pub const ARG: &str = "arg";
     pub const INTERVALS: &str = "intervals";
+    pub const INTERVAL: &str = "interval";
+    pub const CUMULATIVE: &str = "cumulative";
 }
 
 /// The internal representation of a subgraph schema, i.e., the
@@ -131,6 +135,20 @@ impl TypeInfo {
         }
     }
 
+    fn object_type(&self) -> Option<&ObjectType> {
+        match self {
+            TypeInfo::Object(obj_type) => Some(obj_type),
+            TypeInfo::Interface(_) | TypeInfo::Aggregation(_) => None,
+        }
+    }
+
+    fn interface_type(&self) -> Option<&InterfaceType> {
+        match self {
+            TypeInfo::Interface(intf_type) => Some(intf_type),
+            TypeInfo::Object(_) | TypeInfo::Aggregation(_) => None,
+        }
+    }
+
     fn aggregation(&self) -> Option<&Aggregation> {
         match self {
             TypeInfo::Aggregation(agg_type) => Some(agg_type),
@@ -199,17 +217,22 @@ pub struct Field {
     pub name: Word,
     pub field_type: s::Type,
     pub value_type: ValueType,
-    pub is_derived: bool,
+    derived_from: Option<Word>,
 }
 
 impl Field {
-    pub fn new(schema: &Schema, name: &str, field_type: &s::Type, is_derived: bool) -> Self {
+    pub fn new(
+        schema: &Schema,
+        name: &str,
+        field_type: &s::Type,
+        derived_from: Option<Word>,
+    ) -> Self {
         let value_type = Self::scalar_value_type(&schema, field_type);
         Self {
             name: Word::from(name),
             field_type: field_type.clone(),
             value_type,
-            is_derived,
+            derived_from,
         }
     }
 
@@ -255,6 +278,117 @@ impl Field {
             s::Type::ListType(inner) => Self::scalar_value_type(schema, inner),
         }
     }
+
+    pub fn is_list(&self) -> bool {
+        self.field_type.is_list()
+    }
+
+    pub fn derived_from<'a>(&self, schema: &'a InputSchema) -> Option<&'a Field> {
+        let derived_from = self.derived_from.as_ref()?;
+        let name = schema
+            .pool()
+            .lookup(&self.field_type.get_base_type())
+            .unwrap();
+        schema.field(name, derived_from)
+    }
+
+    pub fn is_derived(&self) -> bool {
+        self.derived_from.is_some()
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum ObjectOrInterface<'a> {
+    Object(&'a InputSchema, &'a ObjectType),
+    Interface(&'a InputSchema, &'a InterfaceType),
+}
+
+impl<'a> ObjectOrInterface<'a> {
+    pub fn object_types(self) -> Vec<EntityType> {
+        let (schema, object_types) = match self {
+            ObjectOrInterface::Object(schema, object) => (schema, vec![object]),
+            ObjectOrInterface::Interface(schema, interface) => {
+                (schema, schema.implementers(interface).collect())
+            }
+        };
+        object_types
+            .into_iter()
+            .map(|object_type| EntityType::new(schema.cheap_clone(), object_type.name))
+            .collect()
+    }
+
+    pub fn typename(&self) -> &str {
+        let (schema, atom) = self.unpack();
+        schema.pool().get(atom).unwrap()
+    }
+
+    /// Return the field with the given name. For interfaces, that is the
+    /// field with that name declared in the interface, not in the
+    /// implementing object types
+    pub fn field(&self, name: &str) -> Option<&Field> {
+        match self {
+            ObjectOrInterface::Object(_, object) => object.field(name),
+            ObjectOrInterface::Interface(_, interface) => interface.field(name),
+        }
+    }
+
+    /// Return the field with the given name. For object types, that's the
+    /// field with that name. For interfaces, it's the field with that name
+    /// in the first object type that implements the interface; to be
+    /// useful, this tacitly assumes that all implementers of an interface
+    /// declare that field in the same way
+    pub fn implemented_field(&self, name: &str) -> Option<&Field> {
+        let object_type = match self {
+            ObjectOrInterface::Object(_, object_type) => Some(*object_type),
+            ObjectOrInterface::Interface(schema, interface) => {
+                schema.implementers(&interface).next()
+            }
+        };
+        object_type.and_then(|object_type| object_type.field(name))
+    }
+
+    pub fn is_interface(&self) -> bool {
+        match self {
+            ObjectOrInterface::Object(_, _) => false,
+            ObjectOrInterface::Interface(_, _) => true,
+        }
+    }
+
+    pub fn derived_from(&self, field_name: &str) -> Option<&str> {
+        let field = self.field(field_name)?;
+        field.derived_from.as_ref().map(|name| name.as_str())
+    }
+
+    pub fn entity_type(&self) -> EntityType {
+        let (schema, atom) = self.unpack();
+        EntityType::new(schema.cheap_clone(), atom)
+    }
+
+    fn unpack(&self) -> (&InputSchema, Atom) {
+        match self {
+            ObjectOrInterface::Object(schema, object) => (schema, object.name),
+            ObjectOrInterface::Interface(schema, interface) => (schema, interface.name),
+        }
+    }
+
+    pub fn is_aggregation(&self) -> bool {
+        match self {
+            ObjectOrInterface::Object(_, object) => object.is_aggregation(),
+            ObjectOrInterface::Interface(_, _) => false,
+        }
+    }
+}
+
+impl CheapClone for ObjectOrInterface<'_> {}
+
+impl std::fmt::Debug for ObjectOrInterface<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (schema, name) = match self {
+            ObjectOrInterface::Object(schema, object) => (schema, object.name),
+            ObjectOrInterface::Interface(schema, interface) => (schema, interface.name),
+        };
+        write!(f, "ObjectOrInterface({})", schema.pool().get(name).unwrap())
+    }
 }
 
 #[derive(PartialEq, Debug)]
@@ -283,8 +417,8 @@ impl ObjectType {
             .fields
             .iter()
             .map(|field| {
-                let is_derived = field.is_derived();
-                Field::new(schema, &field.name, &field.field_type, is_derived)
+                let derived_from = field.derived_from().map(|name| Word::from(name));
+                Field::new(schema, &field.name, &field.field_type, derived_from)
             })
             .collect();
         let interfaces = object_type
@@ -324,13 +458,13 @@ impl ObjectType {
                 name: ID.clone(),
                 field_type: s::Type::NamedType("ID".to_string()),
                 value_type: ValueType::String,
-                is_derived: false,
+                derived_from: None,
             },
             Field {
                 name: Word::from(POI_DIGEST),
                 field_type: s::Type::NamedType("String".to_string()),
                 value_type: ValueType::String,
-                is_derived: false,
+                derived_from: None,
             },
         ]
         .into_boxed_slice();
@@ -349,7 +483,7 @@ impl ObjectType {
         }
     }
 
-    fn field(&self, name: &str) -> Option<&Field> {
+    pub fn field(&self, name: &str) -> Option<&Field> {
         self.fields.iter().find(|field| field.name == name)
     }
 
@@ -368,6 +502,7 @@ pub struct InterfaceType {
     /// is not implemented at all, we arbitrarily use `String`
     pub id_type: IdType,
     pub fields: Box<[Field]>,
+    implementers: Box<[Atom]>,
 }
 
 impl InterfaceType {
@@ -380,7 +515,15 @@ impl InterfaceType {
         let fields = interface_type
             .fields
             .iter()
-            .map(|field| Field::new(schema, &field.name, &field.field_type, false))
+            .map(|field| {
+                // It's very unclear what it means for an interface field to
+                // be derived; but for legacy reasons, we need to allow it
+                // since the API schema does not contain certain filters for
+                // derived fields on interfaces that it would for
+                // non-derived fields
+                let derived_from = field.derived_from().map(|name| Word::from(name));
+                Field::new(schema, &field.name, &field.field_type, derived_from)
+            })
             .collect();
         let name = pool
             .lookup(&interface_type.name)
@@ -389,11 +532,23 @@ impl InterfaceType {
             .first()
             .map(|obj_type| IdType::try_from(obj_type).expect("validation caught any issues here"))
             .unwrap_or(IdType::String);
+        let implementers = implementers
+            .iter()
+            .map(|obj_type| {
+                pool.lookup(&obj_type.name)
+                    .expect("object type names have been interned")
+            })
+            .collect();
         Self {
             name,
             id_type,
             fields,
+            implementers,
         }
+    }
+
+    fn field(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|field| field.name == name)
     }
 }
 
@@ -493,7 +648,7 @@ pub enum AggregationInterval {
 }
 
 impl AggregationInterval {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             AggregationInterval::Hour => "hour",
             AggregationInterval::Day => "day",
@@ -523,6 +678,12 @@ impl AggregationInterval {
                 lower..upper
             })
             .collect()
+    }
+}
+
+impl std::fmt::Display for AggregationInterval {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -594,40 +755,26 @@ impl AggregationMapping {
     }
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub struct Arg {
-    pub name: Word,
-    pub value_type: ValueType,
-}
-
-impl Arg {
-    fn new(name: Word, src_type: &s::ObjectType) -> Self {
-        let value_type = src_type
-            .field(&name)
-            .unwrap()
-            .field_type
-            .value_type()
-            .unwrap();
-        Self { name, value_type }
-    }
-}
+/// The `@aggregate` annotation in an aggregation. The annotation controls
+/// how values from the source table are aggregated
 #[derive(PartialEq, Debug)]
 pub struct Aggregate {
+    /// The name of the aggregate field in the aggregation
     pub name: Word,
+    /// The function used to aggregate the values
     pub func: AggregateFn,
-    pub arg: Option<Arg>,
+    /// The field to aggregate in the source table
+    pub arg: Word,
+    /// The type of the field `name` in the aggregation
     pub field_type: s::Type,
+    /// The `ValueType` corresponding to `field_type`
     pub value_type: ValueType,
+    /// Whether the aggregation is cumulative
+    pub cumulative: bool,
 }
 
 impl Aggregate {
-    fn new(
-        _schema: &Schema,
-        src_type: &s::ObjectType,
-        name: &str,
-        field_type: &s::Type,
-        dir: &s::Directive,
-    ) -> Self {
+    fn new(_schema: &Schema, name: &str, field_type: &s::Type, dir: &s::Directive) -> Self {
         let func = dir
             .argument("fn")
             .unwrap()
@@ -635,14 +782,27 @@ impl Aggregate {
             .unwrap()
             .parse()
             .unwrap();
+        // The only aggregation function we have that doesn't take an
+        // argument is `count`; we just pretend that the user wanted to
+        // `count(id)`. When we form a query, we ignore the argument for
+        // `count`
         let arg = dir
             .argument("arg")
             .map(|arg| Word::from(arg.as_str().unwrap()))
-            .map(|arg| Arg::new(arg, src_type));
+            .unwrap_or_else(|| ID.clone());
+        let cumulative = dir
+            .argument(kw::CUMULATIVE)
+            .map(|arg| match arg {
+                Value::Boolean(b) => *b,
+                _ => unreachable!("validation ensures this is a boolean"),
+            })
+            .unwrap_or(false);
+
         Aggregate {
             name: Word::from(name),
             func,
             arg,
+            cumulative,
             field_type: field_type.clone(),
             value_type: field_type.get_base_type().parse().unwrap(),
         }
@@ -655,7 +815,7 @@ impl Aggregate {
             name: self.name.clone(),
             field_type: self.field_type.clone(),
             value_type: self.value_type,
-            is_derived: false,
+            derived_from: None,
         }
     }
 }
@@ -686,21 +846,18 @@ impl Aggregation {
             .unwrap()
             .as_str()
             .unwrap();
-        let src_type = schema.document.get_object_type_definition(source).unwrap();
         let source = pool.lookup(source).unwrap();
         let fields: Box<[_]> = agg_type
             .fields
             .iter()
             .filter(|field| field.find_directive(kw::AGGREGATE).is_none())
-            .map(|field| Field::new(schema, &field.name, &field.field_type, false))
+            .map(|field| Field::new(schema, &field.name, &field.field_type, None))
             .collect();
         let aggregates: Box<[_]> = agg_type
             .fields
             .iter()
             .filter_map(|field| field.find_directive(kw::AGGREGATE).map(|dir| (field, dir)))
-            .map(|(field, dir)| {
-                Aggregate::new(schema, src_type, &field.name, &field.field_type, dir)
-            })
+            .map(|(field, dir)| Aggregate::new(schema, &field.name, &field.field_type, dir))
             .collect();
 
         let obj_types = intervals
@@ -754,10 +911,23 @@ impl Aggregation {
         self.obj_types.iter().any(|obj_type| obj_type.name == atom)
     }
 
+    fn aggregated_type(&self, atom: Atom) -> Option<&ObjectType> {
+        self.obj_types.iter().find(|obj_type| obj_type.name == atom)
+    }
+
     pub fn dimensions(&self) -> impl Iterator<Item = &Field> {
         self.fields
             .into_iter()
             .filter(|field| &field.name != &*ID && field.name != kw::TIMESTAMP)
+    }
+
+    fn object_type(&self, interval: AggregationInterval) -> Option<&ObjectType> {
+        let pos = self.intervals.iter().position(|i| *i == interval)?;
+        Some(&self.obj_types[pos])
+    }
+
+    fn field(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|field| field.name == name)
     }
 }
 
@@ -898,7 +1068,7 @@ impl InputSchema {
     /// `InputSchema`
     pub fn api_schema(&self) -> Result<ApiSchema, anyhow::Error> {
         let mut schema = self.inner.schema.clone();
-        schema.document = api_schema(&self.inner.schema)?;
+        schema.document = api_schema(self)?;
         schema.add_subgraph_id_directives(schema.id.clone());
         ApiSchema::from_api_schema(schema)
     }
@@ -935,7 +1105,7 @@ impl InputSchema {
             .inner
             .schema
             .document
-            .get_object_type_definition(key.entity_type.as_str())
+            .get_object_type_definition(key.entity_type.typename())
             .ok_or_else(|| field_err(key, "unknown entity type"))?
             .field(&key.entity_field)
             .ok_or_else(|| field_err(key, "unknown field"))?;
@@ -957,9 +1127,9 @@ impl InputSchema {
 
     /// Return the `TypeInfo` for the type with name `atom`. For object and
     /// interface types, `atom` must be the name of the type. For
-    /// aggregations, `atom` must be the name of one of the object types
-    /// that are part of the aggregation. If `atom` is the name of the
-    /// aggregation itself, this returns an `Err`
+    /// aggregations, `atom` must be either the name of the aggregation or
+    /// the name of one of the object types that are part of the
+    /// aggregation.
     fn type_info(&self, atom: Atom) -> Result<&TypeInfo, Error> {
         for ti in self.inner.type_infos.iter() {
             match ti {
@@ -974,7 +1144,7 @@ impl InputSchema {
                     }
                 }
                 TypeInfo::Aggregation(agg_type) => {
-                    if agg_type.has_object_type(atom) {
+                    if agg_type.name == atom || agg_type.has_object_type(atom) {
                         return Ok(ti);
                     }
                 }
@@ -1037,6 +1207,16 @@ impl InputSchema {
         })
     }
 
+    fn implementers<'a>(
+        &'a self,
+        interface: &'a InterfaceType,
+    ) -> impl Iterator<Item = &'a ObjectType> {
+        interface
+            .implementers
+            .iter()
+            .map(|atom| self.object_type(*atom).unwrap())
+    }
+
     /// Return a list of all entity types that implement one of the
     /// interfaces that `entity_type` implements
     pub(in crate::schema) fn share_interfaces(
@@ -1082,6 +1262,42 @@ impl InputSchema {
                     .ok_or_else(|| anyhow!("type_info returns an aggregation only when it has the requested object type"))
             }
         }
+    }
+
+    fn types_with_kind(&self, kind: TypeKind) -> impl Iterator<Item = (&str, &TypeInfo)> {
+        self.inner
+            .type_infos
+            .iter()
+            .filter(move |ti| ti.kind() == kind)
+            .map(|ti| {
+                let name = self.inner.pool.get(ti.name()).unwrap();
+                (name, ti)
+            })
+    }
+
+    /// Return a list of all object types, i.e., types defined with an
+    /// `@entity` annotation. This does not include the type for the PoI
+    pub(in crate::schema) fn object_types(&self) -> impl Iterator<Item = (&str, &ObjectType)> {
+        self.types_with_kind(TypeKind::Object)
+            .filter(|(name, _)| {
+                // Filter out the POI object type
+                name != &POI_OBJECT
+            })
+            .filter_map(|(name, ti)| ti.object_type().map(|obj| (name, obj)))
+    }
+
+    pub(in crate::schema) fn interface_types(
+        &self,
+    ) -> impl Iterator<Item = (&str, &InterfaceType)> {
+        self.types_with_kind(TypeKind::Interface)
+            .filter_map(|(name, ti)| ti.interface_type().map(|intf| (name, intf)))
+    }
+
+    pub(in crate::schema) fn aggregation_types(
+        &self,
+    ) -> impl Iterator<Item = (&str, &Aggregation)> {
+        self.types_with_kind(TypeKind::Aggregation)
+            .filter_map(|(name, ti)| ti.aggregation().map(|intf| (name, intf)))
     }
 
     /// Return a list of the names of all enum types
@@ -1256,8 +1472,94 @@ impl InputSchema {
         }
     }
 
-    pub(in crate::schema) fn type_kind(&self, atom: Atom) -> Option<TypeKind> {
-        self.type_info(atom).ok().map(|ti| ti.kind())
+    /// For the `name` of a type declared in the input schema, return
+    /// whether it is a normal object, declared with `@entity`, an
+    /// interface, or an aggregation. If there is no type `name`, or it is
+    /// not one of these three kinds, return `None`
+    pub fn kind_of_declared_type(&self, name: &str) -> Option<TypeKind> {
+        let name = self.inner.pool.lookup(name)?;
+        self.inner.type_infos.iter().find_map(|ti| {
+            if ti.name() == name {
+                Some(ti.kind())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Return `true` if `atom` is an object type, i.e., a type that is
+    /// declared with an `@entity` directive in the input schema. This
+    /// specifically excludes interfaces and aggregations.
+    pub(crate) fn is_object_type(&self, atom: Atom) -> bool {
+        self.inner.type_infos.iter().any(|ti| match ti {
+            TypeInfo::Object(obj_type) => obj_type.name == atom,
+            _ => false,
+        })
+    }
+
+    pub(crate) fn typename(&self, atom: Atom) -> &str {
+        let name = self.type_info(atom).unwrap().name();
+        self.inner.pool.get(name).unwrap()
+    }
+
+    pub(in crate::schema) fn field(&self, type_name: Atom, name: &str) -> Option<&Field> {
+        let ti = self.type_info(type_name).ok()?;
+        match ti {
+            TypeInfo::Object(obj_type) => obj_type.field(name),
+            TypeInfo::Aggregation(agg_type) => {
+                if agg_type.name == type_name {
+                    agg_type.field(name)
+                } else {
+                    agg_type
+                        .aggregated_type(type_name)
+                        .and_then(|obj_type| obj_type.field(name))
+                }
+            }
+            TypeInfo::Interface(intf_type) => intf_type.field(name),
+        }
+    }
+
+    /// Resolve the given name and interval into an object or interface
+    /// type. If `name` refers to an object or interface type, return that
+    /// regardless of the value of `interval`. If `name` refers to an
+    /// aggregation, return the object type of that aggregation for the
+    /// given `interval`
+    pub fn object_or_interface(
+        &self,
+        name: &str,
+        interval: Option<AggregationInterval>,
+    ) -> Option<ObjectOrInterface<'_>> {
+        let name = self.inner.pool.lookup(name)?;
+        let ti = self.inner.type_infos.iter().find(|ti| ti.name() == name)?;
+        match (ti, interval) {
+            (TypeInfo::Object(obj_type), _) => Some(ObjectOrInterface::Object(self, obj_type)),
+            (TypeInfo::Interface(intf_type), _) => {
+                Some(ObjectOrInterface::Interface(self, intf_type))
+            }
+            (TypeInfo::Aggregation(agg_type), Some(interval)) => agg_type
+                .object_type(interval)
+                .map(|object_type| ObjectOrInterface::Object(self, object_type)),
+            (TypeInfo::Aggregation(_), None) => None,
+        }
+    }
+
+    /// Return an `EntityType` that either references the object type `name`
+    /// or, if `name` references an aggregation, return the object type of
+    /// that aggregation for the given `interval`
+    pub fn object_or_aggregation(
+        &self,
+        name: &str,
+        interval: Option<AggregationInterval>,
+    ) -> Option<EntityType> {
+        let name = self.inner.pool.lookup(name)?;
+        let ti = self.inner.type_infos.iter().find(|ti| ti.name() == name)?;
+        let obj_type = match (ti, interval) {
+            (TypeInfo::Object(obj_type), _) => Some(obj_type),
+            (TypeInfo::Interface(_), _) => None,
+            (TypeInfo::Aggregation(agg_type), Some(interval)) => agg_type.object_type(interval),
+            (TypeInfo::Aggregation(_), None) => None,
+        }?;
+        Some(EntityType::new(self.cheap_clone(), obj_type.name))
     }
 }
 
@@ -1341,21 +1643,21 @@ fn atom_pool(document: &s::Document) -> AtomPool {
 mod validations {
     use std::{collections::HashSet, str::FromStr};
 
-    use inflector::Inflector;
     use itertools::Itertools;
     use semver::Version;
 
     use crate::{
         data::{
             graphql::{
-                ext::DirectiveFinder, DirectiveExt, DocumentExt, ObjectTypeExt, TypeExt, ValueExt,
+                ext::{DirectiveFinder, FieldExt},
+                DirectiveExt, DocumentExt, ObjectTypeExt, TypeExt, ValueExt,
             },
             store::{IdType, ValueType, ID},
             subgraph::SPEC_VERSION_1_1_0,
         },
         prelude::s,
         schema::{
-            input_schema::{kw, AggregateFn, AggregationInterval},
+            input::{kw, sqlexpr, AggregateFn, AggregationInterval},
             FulltextAlgorithm, FulltextLanguage, Schema as BaseSchema, SchemaValidationError,
             SchemaValidationError as Err, Strings, SCHEMA_TYPE_NAME,
         },
@@ -1484,9 +1786,8 @@ mod validations {
             // to create the field names in `graphql::schema::api::query_fields_for_type()`.
             if self.entity_types.iter().any(|typ| {
                 typ.fields.iter().any(|field| {
-                    name == &field.name.as_str().to_camel_case()
-                        || name == &field.name.to_plural().to_camel_case()
-                        || field.name.eq(name)
+                    let (singular, plural) = field.camel_cased_names();
+                    name == &singular || name == &plural || field.name.eq(name)
                 })
             }) {
                 return vec![SchemaValidationError::FulltextNameCollision(
@@ -1649,13 +1950,30 @@ mod validations {
                 })
         }
 
-        /// The `@entity` direactive accepts two flags `immutable` and
+        /// The `@entity` directive accepts two flags `immutable` and
         /// `timeseries`, and when `timeseries` is `true`, `immutable` can
         /// not be `false`.
         ///
         /// For timeseries, also check that there is a `timestamp` field of
-        /// type `Int8`
+        /// type `Int8` and that the `id` field has type `Int8`
         fn validate_entity_directives(&self) -> Vec<SchemaValidationError> {
+            fn id_type_is_int8(object_type: &s::ObjectType) -> Option<SchemaValidationError> {
+                let field = match object_type.field(&*ID) {
+                    Some(field) => field,
+                    None => {
+                        return Some(Err::IdFieldMissing(object_type.name.to_owned()));
+                    }
+                };
+
+                match field.field_type.value_type() {
+                    Ok(ValueType::Int8) => None,
+                    Ok(_) | Err(_) => Some(Err::IllegalIdType(format!(
+                        "Timeseries `{}` must have an `id` field of type `Int8`",
+                        object_type.name
+                    ))),
+                }
+            }
+
             fn bool_arg(
                 dir: &s::Directive,
                 name: &str,
@@ -1688,7 +2006,8 @@ mod validations {
                                 object_type.name.clone(),
                             ))
                         } else {
-                            Self::valid_timestamp_field(object_type)
+                            id_type_is_int8(object_type)
+                                .or_else(|| Self::valid_timestamp_field(object_type))
                         }
                     } else {
                         None
@@ -2146,24 +2465,12 @@ mod validations {
                                     }
                                 }
                             };
-                            let arg_type = match source.field(arg) {
-                                Some(arg_field) => match arg_field.field_type.value_type() {
-                                    Ok(arg_type) if arg_type.is_numeric() => arg_type,
-                                    Ok(_) | Err(_) => {
-                                        errors.push(Err::AggregationNonNumericArg(
-                                            agg_type.name.to_owned(),
-                                            field.name.to_owned(),
-                                            source.name.to_owned(),
-                                            arg.to_owned(),
-                                        ));
-                                        continue;
-                                    }
-                                },
-                                None => {
-                                    errors.push(Err::AggregationUnknownArg(
+                            match agg.argument(kw::CUMULATIVE) {
+                                Some(s::Value::Boolean(_)) | None => { /* ok */ }
+                                Some(_) => {
+                                    errors.push(Err::AggregationInvalidCumulative(
                                         agg_type.name.to_owned(),
                                         field.name.to_owned(),
-                                        arg.to_owned(),
                                     ));
                                     continue;
                                 }
@@ -2178,14 +2485,46 @@ mod validations {
                                     continue;
                                 }
                             };
-                            if arg_type > field_type {
-                                errors.push(Err::AggregationNonMatchingArg(
-                                    agg_type.name.to_owned(),
-                                    field.name.to_owned(),
-                                    arg.to_owned(),
-                                    arg_type.to_str().to_owned(),
-                                    field_type.to_str().to_owned(),
-                                ));
+                            // It would be nicer to use a proper struct here
+                            // and have that implement
+                            // `sqlexpr::ExprVisitor` but we need access to
+                            // a bunch of local variables that would make
+                            // setting up that struct a bit awkward, so we
+                            // use a closure instead
+                            let check_ident = |ident: &str| -> Result<(), SchemaValidationError> {
+                                let arg_type = match source.field(ident) {
+                                    Some(arg_field) => match arg_field.field_type.value_type() {
+                                        Ok(arg_type) if arg_type.is_numeric() => arg_type,
+                                        Ok(_) | Err(_) => {
+                                            return Err(Err::AggregationNonNumericArg(
+                                                agg_type.name.to_owned(),
+                                                field.name.to_owned(),
+                                                source.name.to_owned(),
+                                                arg.to_owned(),
+                                            ));
+                                        }
+                                    },
+                                    None => {
+                                        return Err(Err::AggregationUnknownArg(
+                                            agg_type.name.to_owned(),
+                                            field.name.to_owned(),
+                                            arg.to_owned(),
+                                        ));
+                                    }
+                                };
+                                if arg_type > field_type {
+                                    return Err(Err::AggregationNonMatchingArg(
+                                        agg_type.name.to_owned(),
+                                        field.name.to_owned(),
+                                        arg.to_owned(),
+                                        arg_type.to_str().to_owned(),
+                                        field_type.to_str().to_owned(),
+                                    ));
+                                }
+                                Ok(())
+                            };
+                            if let Err(mut errs) = sqlexpr::parse(arg, check_ident) {
+                                errors.append(&mut errs);
                             }
                         }
                         None => {
@@ -2704,7 +3043,7 @@ type Gravatar @entity {
                         if errs.iter().any(|err| {
                             err.to_string().contains(&msg) || format!("{err:?}").contains(&msg)
                         }) {
-                            println!("{file_name} failed as expected: {errs:?}",)
+                            // println!("{file_name} failed as expected: {errs:?}",)
                         } else {
                             let msgs: Vec<_> = errs.iter().map(|err| err.to_string()).collect();
                             panic!(
@@ -2713,7 +3052,7 @@ type Gravatar @entity {
                         }
                     }
                     (true, Ok(_)) => {
-                        println!("{file_name} validated as expected")
+                        // println!("{file_name} validated as expected")
                     }
                 }
             }
@@ -2727,7 +3066,7 @@ mod tests {
         data::store::ID,
         prelude::DeploymentHash,
         schema::{
-            input_schema::{POI_DIGEST, POI_OBJECT},
+            input::{POI_DIGEST, POI_OBJECT},
             EntityType,
         },
     };
@@ -2778,10 +3117,10 @@ mod tests {
     fn entity_type() {
         let schema = make_schema();
 
-        assert_eq!("Thing", schema.entity_type("Thing").unwrap().as_str());
+        assert_eq!("Thing", schema.entity_type("Thing").unwrap().typename());
 
         let poi = schema.entity_type(POI_OBJECT).unwrap();
-        assert_eq!(POI_OBJECT, poi.as_str());
+        assert_eq!(POI_OBJECT, poi.typename());
         assert!(poi.has_field(schema.pool().lookup(&ID).unwrap()));
         assert!(poi.has_field(schema.pool().lookup(POI_DIGEST).unwrap()));
         assert!(poi.object_type().is_ok());

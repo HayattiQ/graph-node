@@ -748,10 +748,7 @@ fn insert_subgraph_error(conn: &PgConnection, error: &SubgraphError) -> anyhow::
     } = error;
 
     let block_num = match &block_ptr {
-        None => {
-            assert_eq!(*deterministic, false);
-            crate::block_range::BLOCK_UNVERSIONED
-        }
+        None => crate::block_range::BLOCK_UNVERSIONED,
         Some(block) => crate::block_range::block_number(block),
     };
 
@@ -1030,7 +1027,7 @@ pub(crate) fn copy_errors(
 ///
 /// Since long-running operations, like a vacuum on one of the tables in the
 /// schema, could block dropping the schema indefinitely, this operation
-/// will wait at most 2s to aquire all necessary locks, and fail if that is
+/// will wait at most 2s to acquire all necessary locks, and fail if that is
 /// not possible.
 pub fn drop_schema(
     conn: &diesel::pg::PgConnection,
@@ -1095,7 +1092,7 @@ pub fn create_deployment(
     let entities_with_causality_region = Vec::from_iter(
         entities_with_causality_region
             .into_iter()
-            .map(|et| et.as_str().to_owned()),
+            .map(|et| et.typename().to_owned()),
     );
 
     let deployment_values = (
